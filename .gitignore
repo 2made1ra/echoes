@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Результаты замеров
+eval/results/
+
+.env
+
+# Приватное: рабочие дизайн-доки и инструкции, персоны пользователя.
+# Публичная документация — public_docs/, шаблон персоны — public_docs/persona-example/.
+docs/
+CLAUDE.md
+persona/*
+!persona/_shared/

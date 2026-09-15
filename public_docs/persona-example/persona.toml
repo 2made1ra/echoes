@@ -1,0 +1,17 @@
+# Настройки персоны. Текст характера — в card.md и reinject.md, здесь только параметры.
+
+display_name = "Смотритель маяка"
+
+# N переинжекта для этой персоны. Если не задан — REINJECT_EVERY из окружения.
+# reinject_every = 6
+
+# Подключать ли общий блок persona/_shared/safety.md перед карточкой.
+safety = true
+
+[ui]
+title = "Маяк"
+placeholder = "Постучать..."
+new_session = "Новый путник"
+close_session = "Записать в журнал"
+archived = "В вахтенный журнал"
+accent = "#3a86c8"
