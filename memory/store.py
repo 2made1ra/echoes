@@ -33,7 +33,7 @@ class MemoryStore:
         longterm: LongTermMemory,
         embedder: Embedder,
         *,
-        top_k: int = 3,
+        top_k: int,
         score_threshold: float | None = None,
     ) -> None:
         self._session = session
@@ -46,7 +46,9 @@ class MemoryStore:
     @classmethod
     def from_settings(cls, settings: Settings, embedder: Embedder) -> "MemoryStore":
         return cls(
-            SessionMemory.from_url(settings.redis_url),
+            SessionMemory.from_url(
+                settings.redis_url, ttl_seconds=settings.session_ttl_days * 24 * 60 * 60
+            ),
             LongTermMemory.from_url(
                 settings.qdrant_url, settings.qdrant_collection, settings.embedding_dim
             ),
@@ -80,10 +82,13 @@ class MemoryStore:
     async def start_session(self, user_id: str, persona: str, first_message: str) -> str:
         session_id = str(uuid.uuid4())
         await self._session.register(user_id, session_id, persona)
-        # First Message кладётся в историю как реплика ассистента: он задаёт
+        # Первая реплика кладётся в историю как реплика ассистента: она задаёт
         # длину и тон, которые модель копирует весь диалог.
         await self._session.append(user_id, session_id, "assistant", first_message)
         return session_id
+
+    async def draw_opening(self, user_id: str, persona: str, deck: str, size: int) -> int:
+        return await self._session.draw_opening(user_id, persona, deck, size)
 
     async def session_persona(self, user_id: str, session_id: str) -> str | None:
         return await self._session.persona(user_id, session_id)

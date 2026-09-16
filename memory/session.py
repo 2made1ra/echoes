@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,9 @@ _MESSAGES = "chat:session:{user_id}:{session_id}:messages"
 _TURNS = "chat:session:{user_id}:{session_id}:user_turns"
 _META = "chat:session:{user_id}:{session_id}:meta"
 _SESSIONS = "chat:user:{user_id}:sessions"
+# Колода первых реплик пользователя: ещё не показанные номера и последний.
+_DECK = "chat:user:{user_id}:openings:{persona}:{deck}"
+_DECK_LAST = "chat:user:{user_id}:openings:{persona}:last"
 
 
 @dataclass(frozen=True)
@@ -33,7 +37,7 @@ class SessionInfo:
 
 
 class SessionMemory:
-    def __init__(self, redis: Redis, ttl_seconds: int = 60 * 60 * 24 * 30) -> None:
+    def __init__(self, redis: Redis, *, ttl_seconds: int) -> None:
         self._redis = redis
         self._ttl = ttl_seconds
 
@@ -82,6 +86,28 @@ class SessionMemory:
             _META.format(user_id=user_id, session_id=session_id),
         )
         await self._redis.srem(_SESSIONS.format(user_id=user_id), session_id)
+
+    async def draw_opening(self, user_id: str, persona: str, deck: str, size: int) -> int:
+        """Номер следующей первой реплики: без повторов, пока колода не кончится.
+
+        Колода тасуется заново, когда пуста; на стыке колод последняя
+        показанная реплика не выпадает первой. deck — отпечаток набора
+        реплик: после его правки старая колода просто перестаёт читаться.
+        """
+        key = _DECK.format(user_id=user_id, persona=persona, deck=deck)
+        last_key = _DECK_LAST.format(user_id=user_id, persona=persona)
+        raw = await self._redis.lpop(key)
+        if raw is None or int(raw) >= size:
+            last = await self._redis.get(last_key)
+            order = random.sample(range(size), size)
+            if size > 1 and last is not None and order[0] == int(last):
+                order[0], order[-1] = order[-1], order[0]
+            raw, rest = order[0], order[1:]
+            if rest:
+                await self._redis.rpush(key, *rest)
+        await self._redis.expire(key, self._ttl)
+        await self._redis.set(last_key, int(raw), ex=self._ttl)
+        return int(raw)
 
     async def ping(self) -> bool:
         return bool(await self._redis.ping())

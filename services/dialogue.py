@@ -5,14 +5,16 @@
 HTTP-кодов тут нет — сервис одинаково вызывается из API и из скриптов.
 
 Персона выбирается при создании сессии и дальше берётся из неё: сменить
-персону можно только новой сессией. Стартовая зарисовка отдаётся клиенту и
-нигде не сохраняется — в контекст модели она не попадает.
+персону можно только новой сессией. Начало сессии — пара «зарисовка + первая
+реплика», заранее написанная в файлах персоны; пары выдаются пользователю
+колодой, без повторов. Зарисовка отдаётся клиенту и нигде не сохраняется —
+в контекст модели она не попадает; в историю пишется только реплика.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import random
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -57,6 +59,16 @@ class Reply:
     memories_used: int
 
 
+def _deck_id(card: PersonaCard, length: int) -> str:
+    """Отпечаток набора первых реплик: колода пользователя привязана к нему."""
+    digest = hashlib.sha256()
+    for opening in card.openings:
+        for part in (opening.scene, opening.message):
+            digest.update(part.encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()[:length]
+
+
 class DialogueService:
     def __init__(
         self,
@@ -72,6 +84,10 @@ class DialogueService:
         self._personas = dict(personas)
         self._llm = llm
         self._store = store
+        self._decks = {
+            name: _deck_id(card, settings.deck_fingerprint_chars)
+            for name, card in self._personas.items()
+        }
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> "DialogueService":
@@ -96,12 +112,16 @@ class DialogueService:
 
     async def open_session(self, user_id: str, persona: str | None = None) -> OpenedSession:
         card = self._persona(persona or self._default_persona)
-        session_id = await self._store.start_session(user_id, card.name, card.first_message)
+        index = await self._store.draw_opening(
+            user_id, card.name, self._decks[card.name], len(card.openings)
+        )
+        opening = card.openings[index]
+        session_id = await self._store.start_session(user_id, card.name, opening.message)
         return OpenedSession(
             session_id=session_id,
             persona=card.name,
-            scene=random.choice(card.scenes),
-            message=card.first_message,
+            scene=opening.scene,
+            message=opening.message,
         )
 
     async def reply(self, user_id: str, session_id: str, message: str) -> Reply:
@@ -133,7 +153,7 @@ class DialogueService:
         """Сжать сессию в запись и положить в long-term память персоны."""
         persona = await self._session_persona(user_id, session_id)
         history = await self._store.history(user_id, session_id)
-        if len(history) < 2:
+        if len(history) < self._settings.archive_min_messages:
             raise NothingToArchive()
         if not self._store.longterm_ready:
             raise LongTermUnavailable()
@@ -146,6 +166,9 @@ class DialogueService:
                 session_id=session_id,
                 persona=persona.name,
                 history=history,
+                temperature=self._settings.summarizer_temperature,
+                max_tokens=self._settings.summarizer_max_tokens,
+                preview_chars=self._settings.log_preview_chars,
             )
             await self._store.save_record(record)
         except Exception as exc:

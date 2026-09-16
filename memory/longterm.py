@@ -62,7 +62,7 @@ class LongTermMemory:
         persona: str,
         vector: list[float],
         *,
-        top_k: int = 3,
+        top_k: int,
         score_threshold: float | None = None,
     ) -> list[Record]:
         response = await self._client.query_points(

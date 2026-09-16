@@ -20,11 +20,11 @@ log = logging.getLogger(__name__)
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 
-def _extract_json(raw: str) -> dict:
+def _extract_json(raw: str, preview_chars: int) -> dict:
     cleaned = _FENCE_RE.sub("", raw).strip()
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end == -1:
-        raise ValueError(f"суммаризатор вернул не JSON: {raw[:200]!r}")
+        raise ValueError(f"суммаризатор вернул не JSON: {raw[:preview_chars]!r}")
     return json.loads(cleaned[start : end + 1])
 
 
@@ -43,6 +43,9 @@ async def summarize_session(
     session_id: str,
     persona: str,
     history: list[Message],
+    temperature: float,
+    max_tokens: int,
+    preview_chars: int,
 ) -> Record:
     if not history:
         raise ValueError("нечего суммаризировать: пустая сессия")
@@ -52,10 +55,10 @@ async def summarize_session(
             {"role": "system", "content": prompt},
             {"role": "user", "content": _render_log(history)},
         ],
-        temperature=0.0,
-        max_tokens=500,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    data = _extract_json(raw)
+    data = _extract_json(raw, preview_chars)
     return Record(
         user_id=user_id,
         session_id=session_id,

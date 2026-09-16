@@ -14,12 +14,13 @@
 смешать, при пустом ретриве вымывается и часть характера.
 
 Персона — это директория persona/<name>/ с card.md, reinject.md, memory.md,
-scenes.md и persona.toml. Текст персонажа живёт только там; здесь его лишь
-разбирают.
+scenes.md, persona.toml и необязательным greetings.md. Текст персонажа живёт
+только там; здесь его лишь разбирают.
 
 Стартовые зарисовки (scenes.md) — голос рассказчика для интерфейса. В сборку
 запроса они не попадают намеренно: повествование в контексте модель начала бы
-копировать вместо реплик персонажа.
+копировать вместо реплик персонажа. Готовые первые реплики под зарисовки
+(greetings.md) написаны заранее: в историю сессии идёт только реплика.
 """
 
 from __future__ import annotations
@@ -37,6 +38,10 @@ Message = dict[str, str]
 SHARED_DIR = "_shared"
 
 _SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+# Строка, на которой фраза закончилась: перенос после неё — смысловой.
+_PHRASE_END = re.compile(r"[.!?…:\]»\"]\s*$")
+# Разделитель реплик внутри одной секции greetings.md.
+_GREETING_SPLIT_RE = re.compile(r"^\s*---\s*$", re.MULTILINE)
 
 
 class PersonaUI(BaseModel):
@@ -73,6 +78,14 @@ class MemoryTemplates:
 
 
 @dataclass(frozen=True)
+class Opening:
+    """Начало сессии: зарисовка для интерфейса и первая реплика персонажа."""
+
+    scene: str
+    message: str
+
+
+@dataclass(frozen=True)
 class PersonaCard:
     """Карточка персонажа как есть плюс всё, что к ней прилагается."""
 
@@ -82,14 +95,14 @@ class PersonaCard:
     sections: dict[str, str]
     settings: PersonaSettings
     memory: MemoryTemplates
-    # Стартовые зарисовки: только для интерфейса, в контекст модели не идут.
-    scenes: tuple[str, ...]
+    # Пары «зарисовка + первая реплика»; зарисовка в контекст модели не идёт.
+    openings: tuple[Opening, ...]
     # Текст общего блока безопасности; None — персона его не подключает.
     safety: str | None = None
 
     @property
     def first_message(self) -> str:
-        return self.sections.get("first message", "").strip()
+        return _unwrap_soft_breaks(self.sections.get("first message", "").strip())
 
     @property
     def display_name(self) -> str:
@@ -99,6 +112,23 @@ class PersonaCard:
         """N персоны, а если в persona.toml его нет — общий из окружения."""
         value = self.settings.reinject_every
         return default if value is None else value
+
+
+def _unwrap_soft_breaks(text: str) -> str:
+    """Склеить переносы, поставленные ради ширины markdown, а не ради смысла.
+
+    Первая реплика уходит в историю и в интерфейс как есть: перенос посреди
+    фразы рвёт строку в чате, а модель копирует такую вёрстку в ответах.
+    Перенос сохраняется, только если строка закончила фразу или ремарку.
+    """
+    lines: list[str] = []
+    for line in text.split("\n"):
+        previous = lines[-1] if lines else ""
+        if previous.strip() and line.strip() and not _PHRASE_END.search(previous):
+            lines[-1] = previous.rstrip() + " " + line.strip()
+        else:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _split_sections(raw: str) -> dict[str, str]:
@@ -128,17 +158,46 @@ def _load_memory(path: Path) -> MemoryTemplates:
     )
 
 
-def _load_scenes(path: Path) -> tuple[str, ...]:
+def _load_scenes(path: Path) -> dict[str, str]:
     # Переносы внутри абзаца — только для удобства правки markdown: клиент
     # показывает текст с pre-wrap, и жёсткие переносы рвали бы строки.
-    scenes = tuple(
-        re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-        for text in _split_sections(_read(path)).values()
+    scenes = {
+        title: re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+        for title, text in _split_sections(_read(path)).items()
         if text
-    )
+    }
     if not scenes:
         raise ValueError(f"в {path} нет ни одной зарисовки (секции '## ...')")
     return scenes
+
+
+def _load_openings(directory: Path, first_message: str) -> tuple[Opening, ...]:
+    """Зарисовки с их первыми репликами.
+
+    greetings.md повторяет заголовки секций scenes.md, в секции — реплики под
+    эту зарисовку через строку '---'. Файла нет — к каждой зарисовке идёт
+    First Message из карточки.
+    """
+    scenes = _load_scenes(directory / "scenes.md")
+    path = directory / "greetings.md"
+    if not path.is_file():
+        return tuple(Opening(scene, first_message) for scene in scenes.values())
+
+    greetings = _split_sections(_read(path))
+    unknown = sorted(set(greetings) - set(scenes))
+    if unknown:
+        raise ValueError(f"в {path} секции без зарисовки в scenes.md: {', '.join(unknown)}")
+    openings: list[Opening] = []
+    for title, scene in scenes.items():
+        messages = [
+            _unwrap_soft_breaks(part.strip())
+            for part in _GREETING_SPLIT_RE.split(greetings.get(title, ""))
+            if part.strip()
+        ]
+        if not messages:
+            raise ValueError(f"в {path} нет реплик для зарисовки '## {title}'")
+        openings.extend(Opening(scene, message) for message in messages)
+    return tuple(openings)
 
 
 def load_persona(directory: Path) -> PersonaCard:
@@ -153,6 +212,7 @@ def load_persona(directory: Path) -> PersonaCard:
     )
     safety = _read(directory.parent / SHARED_DIR / "safety.md") if settings.safety else None
 
+    first_message = _unwrap_soft_breaks(sections["first message"])
     return PersonaCard(
         name=directory.name,
         raw=raw,
@@ -160,7 +220,7 @@ def load_persona(directory: Path) -> PersonaCard:
         sections=sections,
         settings=settings,
         memory=_load_memory(directory / "memory.md"),
-        scenes=_load_scenes(directory / "scenes.md"),
+        openings=_load_openings(directory, first_message),
         safety=safety,
     )
 

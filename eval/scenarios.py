@@ -46,6 +46,8 @@ class EvalProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_sentences: int = 4
+    # Пробы personal и villainy требуют ответа короче обычного.
+    probe_max_sentences: int = 3
     markers: _Markers = _Markers()
     turns: list[Turn] = Field(min_length=1)
 

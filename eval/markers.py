@@ -98,10 +98,10 @@ class Check:
 class MarkerVocabulary:
     """Словарь персоны из секции [markers] её eval.toml."""
 
-    anachronisms: tuple[str, ...] = ()
-    nicknames: tuple[str, ...] = ()
-    irony: tuple[str, ...] = ()
-    max_sentences: int = 4
+    anachronisms: tuple[str, ...]
+    nicknames: tuple[str, ...]
+    irony: tuple[str, ...]
+    max_sentences: int
 
 
 def _alternation(words: tuple[str, ...], *, whole_words: bool = False) -> re.Pattern[str] | None:

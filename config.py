@@ -18,12 +18,24 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
     temperature: float = 0.9
-    max_tokens: int = 400
+    # Бюджет токенов на реплику. У reasoning-моделей в него входят и
+    # рассуждения (замер: до ~190 из ~280 на реплику), а при нехватке провайдер
+    # отдаёт пустой ответ. Длину реплики держат карточка и переинжект, не лимит.
+    max_tokens: int = 1000
+
+    # Суммаризация сессии в запись памяти: служебный вызов, нужна точность,
+    # а не разнообразие. Бюджет с запасом на рассуждения: на сессии из 16
+    # реплик они доходили до ~440 токенов при ~600 всего и растут с длиной
+    # лога; при нехватке провайдер отдаёт пустой ответ и закрытие падает с 502.
+    summarizer_temperature: float = 0.0
+    summarizer_max_tokens: int = 2000
 
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
     qdrant_collection: str = "memories"
 
+    # Сколько дней живут история сессии и колода первых реплик в Redis.
+    session_ttl_days: int = 30
     # Сколько последних сообщений сессии уходит в промпт.
     session_window: int = 20
     # N переинжекта: блок напоминания черт каждые N реплик пользователя.
@@ -34,6 +46,24 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 3
     # Ниже этого порога схожести запись считается мусорной и не подтягивается.
     retrieval_score_threshold: float = 0.3
+
+    # Ограничения входа API: длины идентификаторов и реплики пользователя.
+    api_user_id_max_chars: int = 128
+    api_session_id_max_chars: int = 128
+    api_persona_max_chars: int = 64
+    api_message_max_chars: int = 4000
+
+    # Меньше стольких сообщений в истории — сессию нечего сжимать в запись.
+    archive_min_messages: int = 2
+    # Длина отпечатка набора первых реплик в ключе колоды Redis.
+    deck_fingerprint_chars: int = 16
+    # Сколько символов сырого ответа модели показывать в логах и отчётах.
+    log_preview_chars: int = 200
+
+    # Замер дрейфа: доля сохранённых маркеров считается по окнам из
+    # EVAL_WINDOW реплик, всего EVAL_WINDOWS окон (8 × 3 → 1–8 / 9–16 / 17–24).
+    eval_window: int = 8
+    eval_windows: int = 3
 
     # Каждая поддиректория persona/ (кроме _shared) — отдельная персона.
     persona_dir: Path = ROOT / "persona"

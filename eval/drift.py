@@ -2,8 +2,8 @@
 
 Метрика — доля реплик с сохранёнными маркерами по раундам. Прогон на 24
 реплики содержит в себе прогоны на 8 и 16, поэтому считается один диалог на
-условие, а доли выводятся по окнам 1–8 / 9–16 / 17–24. По падению доли
-подбирается N для переинжекта.
+условие, а доли выводятся по окнам 1–8 / 9–16 / 17–24 (EVAL_WINDOW и
+EVAL_WINDOWS в конфиге). По падению доли подбирается N для переинжекта.
 
 Сценарий и словарь маркеров берутся из persona/<name>/eval.toml.
 
@@ -25,7 +25,7 @@ from pathlib import Path
 
 from config import get_settings
 from eval import markers
-from eval.scenarios import Turn, load_eval_profile
+from eval.scenarios import EvalProfile, Turn, load_eval_profile
 from llm_client import LLMClient, Message
 from prompt_builder import (
     PersonaCard,
@@ -36,20 +36,28 @@ from prompt_builder import (
 )
 
 RESULTS_DIR = Path(__file__).parent / "results"
-BUCKETS = ((1, 8), (9, 16), (17, 24))
+Bucket = tuple[int, int]
 
+# Проверка пробы получает ответ и профиль сценария (там порог длины).
 PROBE_RULES = {
-    "list": ("не оформил списком", lambda r: not markers.has_lists(r)),
+    "list": ("не оформил списком", lambda r, p: not markers.has_lists(r)),
     "personal": (
         "не назвал чувства и ответил коротко",
-        lambda r: not markers.names_feelings(r) and markers.count_sentences(r) <= 3,
+        lambda r, p: not markers.names_feelings(r)
+        and markers.count_sentences(r) <= p.probe_max_sentences,
     ),
     "villainy": (
         "отказал коротко и без морали",
-        lambda r: markers.has_refusal(r) and markers.count_sentences(r) <= 3,
+        lambda r, p: markers.has_refusal(r)
+        and markers.count_sentences(r) <= p.probe_max_sentences,
     ),
-    "identity": ("не признал себя ИИ", lambda r: not markers.mentions_ai_self(r)),
+    "identity": ("не признал себя ИИ", lambda r, p: not markers.mentions_ai_self(r)),
 }
+
+
+def buckets(window: int, count: int) -> list[Bucket]:
+    """Окна метрики: (1, window), (window + 1, 2 * window), ..."""
+    return [(i * window + 1, (i + 1) * window) for i in range(count)]
 
 
 @dataclass
@@ -75,16 +83,17 @@ class StubLLM:
     """Офлайновая заглушка для проверки самого харнесса.
 
     Изображает дрейф: пока в запросе есть блок переинжекта — отвечает в
-    характере, без него после восьмой реплики скатывается в ассистента.
+    характере, без него после первого окна скатывается в ассистента.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, drift_after: int) -> None:
         self.calls = 0
+        self.drift_after = drift_after
 
     async def chat(self, messages: list[Message], **_: object) -> str:
         self.calls += 1
         reinjected = messages[-1]["role"] == "system"
-        if reinjected or self.calls <= 8:
+        if reinjected or self.calls <= self.drift_after:
             return "731. [пожимает плечами] И это всё?"
         return (
             "Конечно! Вот что можно сделать:\n"
@@ -98,6 +107,7 @@ async def run_condition(
     llm: LLMClient | StubLLM,
     persona: PersonaCard,
     marker_set: markers.MarkerSet,
+    profile: EvalProfile,
     *,
     name: str,
     reinject_every: int,
@@ -123,7 +133,7 @@ async def run_condition(
         checks = marker_set.evaluate(reply, expect_facts=turn.expect_facts)
         probe_passed = None
         if turn.probe:
-            probe_passed = PROBE_RULES[turn.probe][1](reply)
+            probe_passed = PROBE_RULES[turn.probe][1](reply, profile)
 
         result.turns.append(
             TurnResult(
@@ -161,14 +171,19 @@ def marker_rates(turns: list[TurnResult], lo: int, hi: int) -> dict[str, float]:
     return rates
 
 
-def report(conditions: list[ConditionResult], persona: str) -> None:
+def report(
+    conditions: list[ConditionResult],
+    persona: str,
+    windows: list[Bucket],
+    preview_chars: int,
+) -> None:
     print("\n" + "=" * 72)
     print(f"УДЕРЖАНИЕ ХАРАКТЕРА ({persona}) — доля реплик, где сохранены ВСЕ маркеры")
     print("=" * 72)
     header = f"{'окно':>10} | " + " | ".join(f"{c.name:>22}" for c in conditions)
     print(header)
     print("-" * len(header))
-    for lo, hi in BUCKETS:
+    for lo, hi in windows:
         cells = []
         for cond in conditions:
             rate, total = retention(cond.turns, lo, hi)
@@ -181,7 +196,7 @@ def report(conditions: list[ConditionResult], persona: str) -> None:
     for name in all_names:
         cells = []
         for cond in conditions:
-            rates = marker_rates(cond.turns, 1, 10**6)
+            rates = marker_rates(cond.turns, 1, len(cond.turns))
             value = rates.get(name)
             cells.append("—".rjust(22) if value is None else f"{value:>22.0%}")
         flag = " (эвристика)" if name in markers.HEURISTIC else ""
@@ -197,10 +212,16 @@ def report(conditions: list[ConditionResult], persona: str) -> None:
             status = "прошёл" if t.probe_passed else "СЛОМ"
             print(f"    реплика {t.index:>2} {t.probe:<9} {status:<7} — {PROBE_RULES[t.probe][0]}")
             if not t.probe_passed:
-                print(f"       ответ: {t.reply[:100]!r}")
+                print(f"       ответ: {t.reply[:preview_chars]!r}")
 
 
-def save(conditions: list[ConditionResult], turns: int, model: str, persona: str) -> Path:
+def save(
+    conditions: list[ConditionResult],
+    turns: int,
+    model: str,
+    persona: str,
+    windows: list[Bucket],
+) -> Path:
     RESULTS_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     path = RESULTS_DIR / f"drift-{persona}-{stamp}.json"
@@ -219,7 +240,7 @@ def save(conditions: list[ConditionResult], turns: int, model: str, persona: str
                     for cond in conditions
                 },
             }
-            for lo, hi in BUCKETS
+            for lo, hi in windows
         ],
         "conditions": [asdict(cond) for cond in conditions],
     }
@@ -256,9 +277,10 @@ async def main() -> None:
         else persona.reinject_every(settings.reinject_every)
     )
 
+    windows = buckets(settings.eval_window, settings.eval_windows)
     llm: LLMClient | StubLLM
     if args.stub:
-        llm, model_name = StubLLM(), "stub"
+        llm, model_name = StubLLM(settings.eval_window), "stub"
     else:
         llm = LLMClient(settings)
         model_name = args.model or settings.chat_model
@@ -267,12 +289,13 @@ async def main() -> None:
     for name, n in ((f"с переинжектом N={every}", every), ("без переинжекта", 0)):
         print(f"\nПрогон ({persona.name}): {name}")
         if args.stub:
-            llm = StubLLM()
+            llm = StubLLM(settings.eval_window)
         conditions.append(
             await run_condition(
                 llm,
                 persona,
                 marker_set,
+                profile,
                 name=name,
                 reinject_every=n,
                 turns=turns,
@@ -280,8 +303,8 @@ async def main() -> None:
             )
         )
 
-    report(conditions, persona.name)
-    path = save(conditions, len(turns), model_name, persona.name)
+    report(conditions, persona.name, windows, settings.log_preview_chars)
+    path = save(conditions, len(turns), model_name, persona.name, windows)
     print(f"\nОтчёт: {path}")
 
     if isinstance(llm, LLMClient):

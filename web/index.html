@@ -4,10 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Чат</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=PT+Serif:ital,wght@0,400;0,700;1,400&display=swap">
 <style>
   :root {
     --bg: #12100f; --panel: #1b1817; --line: #2e2826;
     --text: #e6ded8; --muted: #8b807a; --accent: #c1121f;
+    /* Шрифт прямой речи персонажа; ремарки и зарисовки остаются моноширинными. */
+    --speech-font: "PT Serif", Georgia, "Times New Roman", serif;
   }
   * { box-sizing: border-box; }
   body {
@@ -37,6 +42,32 @@
   .msg { max-width: 82%; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user { align-self: flex-end; background: var(--panel); padding: 8px 12px; border-radius: 3px; }
   .msg.char { align-self: flex-start; border-left: 2px solid var(--accent); padding-left: 12px; }
+  /* Голос персонажа отделён от голоса рассказчика: речь — своим шрифтом,
+     ремарки в [скобках] — как зарисовка, приглушённым курсивом. */
+  .msg.char .speech { font-family: var(--speech-font); font-size: 16.5px; line-height: 1.5; }
+  .msg.char .stage { color: var(--muted); font-style: italic; }
+  /* Ожидание ответа: знак бесконечности рисуется и стирается по кругу. */
+  .msg.pending { padding-top: 2px; padding-bottom: 2px; }
+  .infinity { display: block; width: 44px; height: 28px; }
+  .infinity path {
+    fill: none; stroke: var(--accent); stroke-width: 1.6; stroke-linecap: round;
+    stroke-dasharray: 100; animation: infinity-draw 2.4s ease-in-out infinite;
+  }
+  @keyframes infinity-draw {
+    0% { stroke-dashoffset: 100; }
+    50% { stroke-dashoffset: 0; }
+    100% { stroke-dashoffset: -100; }
+  }
+  /* Печать по буквам: каретка мигает, пока текст набирается. */
+  .msg.char.typing { cursor: pointer; }
+  .msg.char.typing::after {
+    content: "▌"; color: var(--accent); margin-left: 1px;
+    animation: caret-blink 1s steps(1) infinite;
+  }
+  @keyframes caret-blink { 50% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .infinity path { animation: none; stroke-dasharray: none; }
+  }
   .msg.scene {
     align-self: stretch; max-width: 100%; color: var(--muted); font-style: italic;
     padding: 4px 0 14px; border-bottom: 1px solid var(--line);
@@ -88,18 +119,103 @@ function storage(key, value) {
   } catch (e) { return null; }
 }
 
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Лемниската одним непрерывным контуром: штрих обходит её целиком.
+const INFINITY_SVG =
+  '<svg class="infinity" viewBox="1 5 22 14" aria-hidden="true"><path pathLength="100" ' +
+  'd="M12 12C14 9.33 16 8 18 8A4 4 0 0 1 18 16C16 16 14 14.67 12 12' +
+  'C10 9.33 8 8 6 8A4 4 0 0 0 6 16C8 16 10 14.67 12 12Z"/></svg>';
+
+// Реплика персонажа: ремарки [в скобках] и прямая речь — разными стилями.
+function charParts(el, text) {
+  return text.split(/(\[[^\]]*\])/).filter(Boolean).map((part) => {
+    const span = document.createElement('span');
+    span.className = part.startsWith('[') ? 'stage' : 'speech';
+    el.appendChild(span);
+    return {span, chars: Array.from(part)};
+  });
+}
+
+function fillChar(el, text) {
+  for (const part of charParts(el, text)) part.span.textContent = part.chars.join('');
+}
+
+// Пауза после символа: знаки препинания держат ритм, ремарки идут быстрее речи.
+function typeDelay(ch, stage) {
+  const base = /[.!?…]/.test(ch) ? 260 : /[,;:—]/.test(ch) ? 110 : ch === '\n' ? 200 : stage ? 12 : 26;
+  return base * (0.6 + Math.random() * 0.8);
+}
+
+function nearBottom() {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+}
+
+// Печать по буквам. Клик по реплике допечатывает её сразу.
+function typeChar(el, text) {
+  return new Promise((resolve) => {
+    const parts = charParts(el, text);
+    let part = 0, pos = 0, timer = null;
+    const finish = () => {
+      clearTimeout(timer);
+      for (const p of parts) p.span.textContent = p.chars.join('');
+      el.classList.remove('typing');
+      el.removeEventListener('click', finish);
+      resolve();
+    };
+    if (reducedMotion) return finish();
+    el.classList.add('typing');
+    el.addEventListener('click', finish);
+    const step = () => {
+      if (part >= parts.length) return finish();
+      const stick = nearBottom();
+      const current = parts[part];
+      const ch = current.chars[pos++];
+      current.span.textContent += ch;
+      if (pos >= current.chars.length) { part++; pos = 0; }
+      if (stick) log.scrollTop = log.scrollHeight;
+      timer = setTimeout(step, typeDelay(ch, current.span.className === 'stage'));
+    };
+    step();
+  });
+}
+
+function addMeta(el, meta) {
+  const m = document.createElement('div');
+  m.className = 'meta';
+  m.textContent = meta;
+  el.appendChild(m);
+}
+
 function add(text, cls, meta) {
   const el = document.createElement('div');
   el.className = 'msg ' + cls;
-  el.textContent = text;
-  if (meta) {
-    const m = document.createElement('div');
-    m.className = 'meta';
-    m.textContent = meta;
-    el.appendChild(m);
-  }
+  if (cls === 'char') fillChar(el, text); else el.textContent = text;
+  if (meta) addMeta(el, meta);
   log.appendChild(el);
   log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+// Место будущей реплики, пока модель думает.
+function addPending() {
+  const el = document.createElement('div');
+  el.className = 'msg char pending';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-label', 'Персонаж отвечает');
+  el.innerHTML = INFINITY_SVG;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+// Место ожидания становится обычной репликой персонажа.
+function settle(pending) {
+  pending.className = 'msg char';
+  pending.removeAttribute('role');
+  pending.removeAttribute('aria-label');
+  pending.innerHTML = '';
+  return pending;
 }
 
 async function call(url, body) {
@@ -163,13 +279,20 @@ form.addEventListener('submit', async (e) => {
   add(text, 'user');
   input.value = '';
   input.disabled = sendBtn.disabled = true;
+  const session = sessionId;
+  const pending = addPending();
   try {
-    const data = await call('/api/chat', {user_id: userId, session_id: sessionId, message: text});
+    const data = await call('/api/chat', {user_id: userId, session_id: session, message: text});
+    // Пока ждали ответ, могли открыть новую сессию — старый ответ не показываем.
+    if (session !== sessionId) return;
+    await typeChar(settle(pending), data.reply);
     const bits = ['реплика ' + data.user_turn];
     if (data.reinjected) bits.push('переинжект');
     if (data.memories_used) bits.push('из памяти: ' + data.memories_used);
-    add(data.reply, 'char', bits.join(' · '));
+    addMeta(pending, bits.join(' · '));
   } catch (e) {
+    pending.remove();
+    if (session !== sessionId) return;
     add(e.message, 'err');
   }
   input.disabled = sendBtn.disabled = false;

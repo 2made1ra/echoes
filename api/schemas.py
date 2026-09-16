@@ -9,21 +9,27 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from config import get_settings
 from memory.record import Record
 from memory.session import SessionInfo
 from prompt_builder import PersonaCard
 from services.dialogue import OpenedSession, Reply
 
+# Ограничения входа читаются один раз: схемы строятся при импорте.
+_limits = get_settings()
+
 
 class UserRequest(BaseModel):
     """Общая часть: пользователь известен по идентификатору, без аутентификации."""
 
-    user_id: str = Field(min_length=1, max_length=128)
+    user_id: str = Field(min_length=1, max_length=_limits.api_user_id_max_chars)
 
 
 class NewSessionRequest(UserRequest):
     # Не указана — берётся DEFAULT_PERSONA из конфига.
-    persona: str | None = Field(default=None, min_length=1, max_length=64)
+    persona: str | None = Field(
+        default=None, min_length=1, max_length=_limits.api_persona_max_chars
+    )
 
 
 class CloseSessionRequest(UserRequest):
@@ -31,8 +37,8 @@ class CloseSessionRequest(UserRequest):
 
 
 class ChatRequest(UserRequest):
-    session_id: str = Field(min_length=1, max_length=128)
-    message: str = Field(min_length=1, max_length=4000)
+    session_id: str = Field(min_length=1, max_length=_limits.api_session_id_max_chars)
+    message: str = Field(min_length=1, max_length=_limits.api_message_max_chars)
 
 
 class NewSessionResponse(BaseModel):
