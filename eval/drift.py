@@ -1,17 +1,20 @@
-"""Замер удержания характера: прогон сценария с переинжектом и без.
+"""Замер дрейфа: держится ли характер к концу диалога, с переинжектом и без.
 
-Метрика — доля реплик с сохранёнными маркерами по раундам. Прогон на 24
-реплики содержит в себе прогоны на 8 и 16, поэтому считается один диалог на
-условие, а доли выводятся по окнам 1–8 / 9–16 / 17–24 (EVAL_WINDOW и
-EVAL_WINDOWS в конфиге). По падению доли подбирается N для переинжекта.
+Сценарий из persona/<name>/eval.toml прогоняется в двух условиях — с
+переинжектом каждые N реплик и без него, по EVAL_RUNS диалогов на условие.
+На каждой реплике считаются маркеры (eval/markers.py); реплика «в характере»,
+если прошла все. Отчёт — доля таких реплик по окнам 1–8 / 9–16 / 17–24
+(EVAL_WINDOW × EVAL_WINDOWS) и дрейф: последнее окно минус первое.
 
-Сценарий и словарь маркеров берутся из persona/<name>/eval.toml.
+Это поверхностная оценка, а не аналитика: несколько диалогов на условие,
+без доверительных интервалов. Разница в несколько п.п. — шум; смотреть стоит
+на явное падение без переинжекта и на то, убирает ли его переинжект.
 
 Запуск:
-    uv run python -m eval.drift                 # персона по умолчанию, весь сценарий
+    uv run python -m eval.drift                   # персона по умолчанию
     uv run python -m eval.drift --persona <name>
-    uv run python -m eval.drift --turns 8
-    uv run python -m eval.drift --stub          # без сети: проверка самого харнесса
+    uv run python -m eval.drift --runs 5 --reinject-every 4
+    uv run python -m eval.drift --mock            # без сети: мок-модель
 """
 
 from __future__ import annotations
@@ -19,12 +22,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import random
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
-from config import get_settings
+from config import Settings, get_settings
 from eval import markers
+from eval.mock import MockLLM
 from eval.scenarios import EvalProfile, Turn, load_eval_profile
 from llm_client import LLMClient, Message
 from prompt_builder import (
@@ -35,29 +43,31 @@ from prompt_builder import (
     should_reinject,
 )
 
+log = logging.getLogger(__name__)
+
 RESULTS_DIR = Path(__file__).parent / "results"
 Bucket = tuple[int, int]
+# N условия без переинжекта.
+BASELINE = 0
 
-# Проверка пробы получает ответ и профиль сценария (там порог длины).
-PROBE_RULES = {
-    "list": ("не оформил списком", lambda r, p: not markers.has_lists(r)),
-    "personal": (
-        "не назвал чувства и ответил коротко",
-        lambda r, p: not markers.names_feelings(r)
-        and markers.count_sentences(r) <= p.probe_max_sentences,
-    ),
-    "villainy": (
-        "отказал коротко и без морали",
-        lambda r, p: markers.has_refusal(r)
-        and markers.count_sentences(r) <= p.probe_max_sentences,
-    ),
-    "identity": ("не признал себя ИИ", lambda r, p: not markers.mentions_ai_self(r)),
+# Пробы на слом роли: проверка получает ответ и профиль сценария (порог длины).
+PROBE_RULES: dict[str, Callable[[str, EvalProfile], bool]] = {
+    "list": lambda r, p: not markers.has_lists(r),
+    "personal": lambda r, p: not markers.names_feelings(r)
+    and markers.count_sentences(r) <= p.probe_max_sentences,
+    "villainy": lambda r, p: markers.has_refusal(r)
+    and markers.count_sentences(r) <= p.probe_max_sentences,
+    "identity": lambda r, p: not markers.mentions_ai_self(r),
 }
 
 
 def buckets(window: int, count: int) -> list[Bucket]:
     """Окна метрики: (1, window), (window + 1, 2 * window), ..."""
     return [(i * window + 1, (i + 1) * window) for i in range(count)]
+
+
+class Chat(Protocol):
+    def chat(self, messages: list[Message], **kwargs: Any) -> Awaitable[str]: ...
 
 
 @dataclass
@@ -67,54 +77,53 @@ class TurnResult:
     reply: str
     reinjected: bool
     checks: dict[str, bool]
-    details: dict[str, str] = field(default_factory=dict)
     probe: str | None = None
     probe_passed: bool | None = None
+
+    @property
+    def in_character(self) -> bool:
+        return all(self.checks.values())
+
+
+@dataclass
+class DialogueResult:
+    turns: list[TurnResult] = field(default_factory=list)
+    # Ошибка провайдера: диалог в подсчёт не входит — обрезанный диалог
+    # занизил бы поздние окна.
+    error: str | None = None
 
 
 @dataclass
 class ConditionResult:
-    name: str
     reinject_every: int
-    turns: list[TurnResult] = field(default_factory=list)
+    dialogues: list[DialogueResult] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return "без переинжекта" if self.reinject_every == BASELINE else f"N={self.reinject_every}"
+
+    @property
+    def turns(self) -> list[TurnResult]:
+        """Реплики всех завершённых диалогов."""
+        return [t for d in self.dialogues if d.error is None for t in d.turns]
+
+    def rate(self, lo: int, hi: int) -> float | None:
+        window = [t for t in self.turns if lo <= t.index <= hi]
+        return sum(t.in_character for t in window) / len(window) if window else None
 
 
-class StubLLM:
-    """Офлайновая заглушка для проверки самого харнесса.
-
-    Изображает дрейф: пока в запросе есть блок переинжекта — отвечает в
-    характере, без него после первого окна скатывается в ассистента.
-    """
-
-    def __init__(self, drift_after: int) -> None:
-        self.calls = 0
-        self.drift_after = drift_after
-
-    async def chat(self, messages: list[Message], **_: object) -> str:
-        self.calls += 1
-        reinjected = messages[-1]["role"] == "system"
-        if reinjected or self.calls <= self.drift_after:
-            return "731. [пожимает плечами] И это всё?"
-        return (
-            "Конечно! Вот что можно сделать:\n"
-            "1. Проверить дверь\n"
-            "2. Позвонить мне\n"
-            "Надеюсь, это было полезно. Чем ещё могу помочь?"
-        )
-
-
-async def run_condition(
-    llm: LLMClient | StubLLM,
+async def run_dialogue(
+    llm: Chat,
     persona: PersonaCard,
     marker_set: markers.MarkerSet,
     profile: EvalProfile,
     *,
-    name: str,
     reinject_every: int,
-    turns: list[Turn],
+    turns: Sequence[Turn],
     window: int,
-) -> ConditionResult:
-    result = ConditionResult(name=name, reinject_every=reinject_every)
+    model: str | None = None,
+) -> DialogueResult:
+    result = DialogueResult()
     history: list[Message] = [{"role": "assistant", "content": persona.first_message}]
 
     for index, turn in enumerate(turns, start=1):
@@ -126,15 +135,18 @@ async def run_condition(
             reinject=reinject,
             window=window,
         )
-        reply = await llm.chat(messages)
+        try:
+            reply = await llm.chat(messages, model=model)
+        except Exception as exc:
+            # Один сбой провайдера не должен стоить всего прогона. Ошибка не
+            # прячется: она в логе и в отчёте.
+            log.error("диалог (N=%s) упал на реплике %s: %s", reinject_every, index, exc)
+            result.error = f"реплика {index}: {exc}"
+            return result
         history.append({"role": "user", "content": turn.text})
         history.append({"role": "assistant", "content": reply})
 
         checks = marker_set.evaluate(reply, expect_facts=turn.expect_facts)
-        probe_passed = None
-        if turn.probe:
-            probe_passed = PROBE_RULES[turn.probe][1](reply, profile)
-
         result.turns.append(
             TurnResult(
                 index=index,
@@ -142,120 +154,165 @@ async def run_condition(
                 reply=reply,
                 reinjected=reinject,
                 checks={c.name: c.passed for c in checks},
-                details={c.name: c.detail for c in checks if c.detail},
                 probe=turn.probe,
-                probe_passed=probe_passed,
+                probe_passed=PROBE_RULES[turn.probe](reply, profile) if turn.probe else None,
             )
         )
-        print(f"  [{name}] реплика {index}/{len(turns)}{' +переинжект' if reinject else ''}")
-
     return result
 
 
-def retention(turns: list[TurnResult], lo: int, hi: int) -> tuple[float | None, int]:
-    """Доля реплик окна, у которых сохранены все маркеры."""
-    window = [t for t in turns if lo <= t.index <= hi]
-    if not window:
-        return None, 0
-    kept = sum(1 for t in window if all(t.checks.values()))
-    return kept / len(window), len(window)
+async def run_conditions(
+    make_llm: Callable[[int, int], Chat],
+    persona: PersonaCard,
+    marker_set: markers.MarkerSet,
+    profile: EvalProfile,
+    *,
+    reinject_every: int,
+    runs: int,
+    turns: Sequence[Turn],
+    window: int,
+    concurrency: int,
+    model: str | None = None,
+) -> list[ConditionResult]:
+    """Оба условия, не больше concurrency диалогов одновременно.
+
+    make_llm(N, run) выдаёт модель для диалога: живой клиент один на всех,
+    мок заводит на каждый диалог свой счётчик и сид.
+    """
+    limit = asyncio.Semaphore(max(concurrency, 1))
+    conditions = [ConditionResult(reinject_every), ConditionResult(BASELINE)]
+
+    async def one(condition: ConditionResult, run: int) -> DialogueResult:
+        async with limit:
+            return await run_dialogue(
+                make_llm(condition.reinject_every, run),
+                persona,
+                marker_set,
+                profile,
+                reinject_every=condition.reinject_every,
+                turns=turns,
+                window=window,
+                model=model,
+            )
+
+    for condition in conditions:
+        condition.dialogues = list(
+            await asyncio.gather(*(one(condition, run) for run in range(runs)))
+        )
+    return conditions
 
 
-def marker_rates(turns: list[TurnResult], lo: int, hi: int) -> dict[str, float]:
-    window = [t for t in turns if lo <= t.index <= hi]
-    names = sorted({name for t in window for name in t.checks})
-    rates: dict[str, float] = {}
-    for name in names:
-        applicable = [t for t in window if name in t.checks]
-        rates[name] = sum(t.checks[name] for t in applicable) / len(applicable)
-    return rates
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0%}"
+
+
+def summarize(conditions: list[ConditionResult], windows: list[Bucket]) -> dict[str, Any]:
+    """Всё, что показывает отчёт; то же уходит в JSON."""
+    summary: dict[str, Any] = {}
+    for c in conditions:
+        rates = [c.rate(lo, hi) for lo, hi in windows]
+        first, last = rates[0], rates[-1]
+        failures = Counter(name for t in c.turns for name, ok in t.checks.items() if not ok)
+        probes = [t.probe_passed for t in c.turns if t.probe]
+        summary[c.name] = {
+            "windows": {f"{lo}-{hi}": rate for (lo, hi), rate in zip(windows, rates)},
+            "drift": None if first is None or last is None else last - first,
+            "completed": sum(d.error is None for d in c.dialogues),
+            "dialogues": len(c.dialogues),
+            "failures": dict(failures.most_common()),
+            "probes_passed": sum(bool(p) for p in probes),
+            "probes": len(probes),
+            "errors": [d.error for d in c.dialogues if d.error],
+        }
+    return summary
 
 
 def report(
     conditions: list[ConditionResult],
+    summary: dict[str, Any],
     persona: str,
     windows: list[Bucket],
-    preview_chars: int,
 ) -> None:
-    print("\n" + "=" * 72)
-    print(f"УДЕРЖАНИЕ ХАРАКТЕРА ({persona}) — доля реплик, где сохранены ВСЕ маркеры")
-    print("=" * 72)
-    header = f"{'окно':>10} | " + " | ".join(f"{c.name:>22}" for c in conditions)
-    print(header)
-    print("-" * len(header))
-    for lo, hi in windows:
-        cells = []
-        for cond in conditions:
-            rate, total = retention(cond.turns, lo, hi)
-            cell = "—" if rate is None else f"{rate:.0%} ({total} реп.)"
-            cells.append(cell.rjust(22))
-        print(f"{f'{lo}–{hi}':>10} | " + " | ".join(cells))
+    names = [c.name for c in conditions]
+    rows = [
+        [f"{lo}–{hi}", *(_pct(summary[n]["windows"][f"{lo}-{hi}"]) for n in names)]
+        for lo, hi in windows
+    ]
+    rows.append([
+        "дрейф",
+        *("—" if summary[n]["drift"] is None else f"{summary[n]['drift'] * 100:+.0f} п.п."
+          for n in names),
+    ])
+    header = ["окно", *names]
+    widths = [max(len(row[i]) for row in (header, *rows)) for i in range(len(header))]
 
-    print("\nПО МАРКЕРАМ (доля пройденных реплик за весь прогон)")
-    all_names = sorted({n for c in conditions for t in c.turns for n in t.checks})
-    for name in all_names:
-        cells = []
-        for cond in conditions:
-            rates = marker_rates(cond.turns, 1, len(cond.turns))
-            value = rates.get(name)
-            cells.append("—".rjust(22) if value is None else f"{value:>22.0%}")
-        flag = " (эвристика)" if name in markers.HEURISTIC else ""
-        print(f"{name:>22} | " + " | ".join(cells) + flag)
+    def line(row: list[str]) -> str:
+        return " | ".join(cell.rjust(width) for cell, width in zip(row, widths))
 
-    print("\nПРОБЫ НА СЛОМ РОЛИ")
-    for cond in conditions:
-        probes = [t for t in cond.turns if t.probe]
-        if not probes:
-            continue
-        print(f"  {cond.name}:")
-        for t in probes:
-            status = "прошёл" if t.probe_passed else "СЛОМ"
-            print(f"    реплика {t.index:>2} {t.probe:<9} {status:<7} — {PROBE_RULES[t.probe][0]}")
-            if not t.probe_passed:
-                print(f"       ответ: {t.reply[:preview_chars]!r}")
+    runs = max(summary[n]["dialogues"] for n in names)
+    print(f"\nДРЕЙФ ({persona}): доля реплик в характере; диалогов на условие: {runs}")
+    print(line(header))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows[:-1]:
+        print(line(row))
+    print("-+-".join("-" * width for width in widths))
+    print(line(rows[-1]))
+    print("дрейф — последнее окно минус первое; разница в несколько п.п. — шум")
+
+    print()
+    for n in names:
+        s = summary[n]
+        top = ", ".join(f"{k} ({v})" for k, v in list(s["failures"].items())[:3]) or "ничего"
+        print(f"{n}: чаще всего ломается — {top}; пробы пройдены {s['probes_passed']}/{s['probes']}")
+        if s["errors"]:
+            print(f"  сбои: {len(s['errors'])} из {s['dialogues']} диалогов не посчитаны "
+                  f"({'; '.join(s['errors'])})")
 
 
-def save(
-    conditions: list[ConditionResult],
-    turns: int,
-    model: str,
-    persona: str,
-    windows: list[Bucket],
-) -> Path:
+def save(conditions: list[ConditionResult], summary: dict[str, Any], meta: dict[str, Any]) -> Path:
     RESULTS_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    path = RESULTS_DIR / f"drift-{persona}-{stamp}.json"
+    path = RESULTS_DIR / f"drift-{meta['persona']}-{stamp}.json"
     payload = {
         "timestamp": stamp,
-        "persona": persona,
-        "model": model,
-        "turns": turns,
-        "buckets": [
-            {
-                "window": f"{lo}-{hi}",
-                **{
-                    cond.name: (lambda r: None if r[0] is None else round(r[0], 3))(
-                        retention(cond.turns, lo, hi)
-                    )
-                    for cond in conditions
-                },
-            }
-            for lo, hi in windows
+        **meta,
+        "summary": summary,
+        "conditions": [
+            {"name": c.name, "dialogues": [asdict(d) for d in c.dialogues]} for c in conditions
         ],
-        "conditions": [asdict(cond) for cond in conditions],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
+def mock_factory(
+    settings: Settings, turns: Sequence[Turn], seed: int, persona: str
+) -> Callable[[int, int], Chat]:
+    def make(n: int, run: int) -> Chat:
+        return MockLLM(
+            turns,
+            random.Random(f"{seed}:mock:{persona}:{n}:{run}"),
+            break_base=settings.eval_mock_break_base,
+            break_per_turn=settings.eval_mock_break_per_turn,
+            error_rate=settings.eval_mock_error_rate,
+        )
+
+    return make
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Замер дрейфа персонажа")
-    parser.add_argument("--persona", default=None, help="персона из persona/ (по умолчанию DEFAULT_PERSONA)")
-    parser.add_argument("--turns", type=int, default=None, help="сколько реплик сценария прогнать (по умолчанию все)")
-    parser.add_argument("--reinject-every", type=int, default=None, help="N переинжекта")
+    parser.add_argument("--persona", default=None,
+                        help="персона из persona/ (по умолчанию DEFAULT_PERSONA)")
+    parser.add_argument("--runs", type=int, default=None,
+                        help="диалогов на условие (по умолчанию EVAL_RUNS)")
+    parser.add_argument("--reinject-every", type=int, default=None,
+                        help="N переинжекта (по умолчанию — N персоны)")
     parser.add_argument("--model", default=None, help="переопределить chat-модель")
-    parser.add_argument("--stub", action="store_true", help="офлайн-заглушка вместо LLM")
+    parser.add_argument("--mock", "--stub", dest="mock", action="store_true",
+                        help="офлайновая мок-модель вместо LLM")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
     settings = get_settings()
     personas = load_personas(settings.persona_dir)
@@ -267,48 +324,58 @@ async def main() -> None:
     persona = personas[persona_name]
     try:
         profile = load_eval_profile(settings.persona_dir / persona.name)
-        turns = profile.script(args.turns or len(profile.turns))
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
-    marker_set = markers.MarkerSet(profile.vocabulary)
+    runs = settings.eval_runs if args.runs is None else args.runs
     every = (
-        args.reinject_every
-        if args.reinject_every is not None
-        else persona.reinject_every(settings.reinject_every)
+        persona.reinject_every(settings.reinject_every)
+        if args.reinject_every is None
+        else args.reinject_every
     )
-
+    if runs < 1 or every < 1:
+        parser.error("--runs и N переинжекта должны быть не меньше 1")
     windows = buckets(settings.eval_window, settings.eval_windows)
-    llm: LLMClient | StubLLM
-    if args.stub:
-        llm, model_name = StubLLM(settings.eval_window), "stub"
+
+    llm: LLMClient | None = None
+    if args.mock:
+        make_llm = mock_factory(settings, profile.turns, settings.eval_seed, persona.name)
+        model_name = "mock"
     else:
-        llm = LLMClient(settings)
+        client = llm = LLMClient(settings)
+        make_llm = lambda n, run: client  # noqa: E731 — один клиент на все диалоги
         model_name = args.model or settings.chat_model
 
-    conditions = []
-    for name, n in ((f"с переинжектом N={every}", every), ("без переинжекта", 0)):
-        print(f"\nПрогон ({persona.name}): {name}")
-        if args.stub:
-            llm = StubLLM(settings.eval_window)
-        conditions.append(
-            await run_condition(
-                llm,
-                persona,
-                marker_set,
-                profile,
-                name=name,
-                reinject_every=n,
-                turns=turns,
-                window=settings.session_window,
-            )
+    calls = 2 * runs * len(profile.turns)
+    print(f"Прогон ({persona.name}, {model_name}): N={every} и без переинжекта, "
+          f"диалогов на условие: {runs}, реплик в диалоге: {len(profile.turns)}, "
+          f"запросов к модели: {calls}")
+    try:
+        conditions = await run_conditions(
+            make_llm,
+            persona,
+            markers.MarkerSet(profile.vocabulary),
+            profile,
+            reinject_every=every,
+            runs=runs,
+            turns=profile.turns,
+            window=settings.session_window,
+            concurrency=settings.eval_concurrency,
+            model=args.model,
         )
+    finally:
+        if llm is not None:
+            await llm.close()
 
-    report(conditions, persona.name, windows, settings.log_preview_chars)
-    path = save(conditions, len(turns), model_name, persona.name, windows)
+    summary = summarize(conditions, windows)
+    report(conditions, summary, persona.name, windows)
+    path = save(conditions, summary, {
+        "persona": persona.name,
+        "model": model_name,
+        "reinject_every": every,
+        "runs": runs,
+        "turns": len(profile.turns),
+    })
     print(f"\nОтчёт: {path}")
-
-    if isinstance(llm, LLMClient):
-        await llm.close()
 
 
 if __name__ == "__main__":

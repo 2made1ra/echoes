@@ -64,6 +64,18 @@ class Settings(BaseSettings):
     # EVAL_WINDOW реплик, всего EVAL_WINDOWS окон (8 × 3 → 1–8 / 9–16 / 17–24).
     eval_window: int = 8
     eval_windows: int = 3
+    # Диалогов на условие: один диалог слишком шумный, доля по окнам
+    # усредняется по нескольким. Больше — точнее, но дороже.
+    eval_runs: int = 3
+    # Сколько диалогов замера идёт к провайдеру одновременно.
+    eval_concurrency: int = 4
+    # Сид мок-модели (--mock): прогон на моке воспроизводим.
+    eval_seed: int = 0
+    # Мок-модель (--mock): шанс сломать роль на первой реплике после
+    # переинжекта, прирост шанса за каждую следующую и доля сбоев провайдера.
+    eval_mock_break_base: float = 0.05
+    eval_mock_break_per_turn: float = 0.04
+    eval_mock_error_rate: float = 0.0
 
     # Каждая поддиректория persona/ (кроме _shared) — отдельная персона.
     persona_dir: Path = ROOT / "persona"

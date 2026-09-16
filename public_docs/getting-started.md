@@ -46,11 +46,30 @@ uv run uvicorn main:app --reload   # или make dev
 ## 5. Замер дрейфа
 
 ```bash
-uv run python -m eval.drift --persona keeper --stub   # без сети: проверить харнесс
+uv run python -m eval.drift --persona keeper --mock   # без сети: проверить замер
 uv run python -m eval.drift --persona keeper          # настоящий прогон
+uv run python -m eval.drift --persona keeper --runs 5 --reinject-every 4
+uv run python -m unittest discover eval               # тесты замера
 ```
 
 Нужен `eval.toml` в директории персоны. Отчёты складываются в `eval/results/`.
+
+Прогон стоит 2 × `EVAL_RUNS` × длина сценария запросов к модели. По умолчанию это 2 × 3 × 24 = 144 запроса.
+
+То же через `make` (`make help` — полный список):
+
+| Команда | Что делает | Запросов при сценарии из 24 реплик |
+|---|---|---|
+| `make eval PERSONA=keeper` | обычный замер; `RUNS=`, `N=`, `MODEL=` переопределяют настройки | 144 |
+| `make eval-quick PERSONA=keeper` | один диалог на условие: быстро проверить, что всё живо | 48 |
+| `make eval-full PERSONA=keeper` | 5 диалогов на условие: результат устойчивее | 240 |
+| `make eval-sweep PERSONA=keeper SWEEP="3 6 12"` | отдельный замер на каждое N — для подбора N | 144 на каждое N |
+| `make eval-all` | замер всех персон, у которых есть `eval.toml` | 144 на персону |
+| `make eval-mock PERSONA=keeper` | мок-модель вместо LLM | 0 |
+| `make eval-mock-drift PERSONA=keeper` | мок с сильным дрейфом | 0 |
+| `make eval-mock-errors PERSONA=keeper` | мок со сбоями провайдера | 0 |
+| `make eval-mock-all` | мок для всех персон | 0 |
+| `make test` | тесты замера | 0 |
 
 ## Остановка
 
